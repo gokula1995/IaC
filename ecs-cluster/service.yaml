@@ -1,0 +1,228 @@
+---
+
+Description: Create Service, Task Definition, Log Group, ECR for Application.
+
+Parameters:
+  ECSStackName:
+    Description: Stack name from previous template which is nothing but Cluster Name
+    Type: String
+    
+  NetworkMode:
+    Description: Specify the network mode. Here we use bridge mode to scale the service as well as to resolve the route 53 SRV record. 
+    Type: String
+    Default: bridge
+  
+  ServiceName:
+    Description: Specify the Service of the Cluster
+    Type: String
+
+  LogGroupName:
+    Description: Specify Log group to create and it will be available in cloudwatch console 
+    Type: String
+
+  RepositoryName:
+    Description: specify the application repository name
+    Type: String
+
+  TaskDefName:
+    Description: Specify the Task definition name
+    Type: String
+  
+  ContainerName:
+    Description: Specify the Containername of the application
+    Type: String
+
+  ContainerPort:
+    Description: Specify the port which was exposed in Dockerfile
+    Type: Number
+  
+  Version:
+    Description: It represents the version of Docker Image
+    Type: String
+    Default: latest
+
+  Region:
+    Description: Create the service in specified Region
+    Type: String
+  
+  TaskCPU:
+    Description: It specifies the virtual cpu for task
+    Type: Number
+  
+  TaskMemory:
+    Description: It specifies the size of the task
+    Type: Number
+  
+  SoftLimit:
+    Description: This Softlimit reserves the memory for task on instances
+    Type: Number
+
+  DesiredCount:
+    Description: this sets the number of desired task to be runn on this cluster
+    Type: Number
+    Default: 1
+  
+  ListenerPort:
+    Description: Specify the listener port for eventify on load balancer
+    Type: Number
+
+Resources:
+
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: 7
+
+  NLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    #DependsOn: NetworkLoadBalancer
+    #Name: !Ref ServiceName
+    Properties:
+      LoadBalancerArn:
+        Fn::ImportValue: !Sub "${ECSStackName}-NLB"
+      Port: !Ref ListenerPort
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NLBTargetGroup
+
+  NLBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    #DependsOn: NetworkLoadBalancer
+    Properties:
+      Name: !Ref ServiceName
+      Port: 80
+      Protocol: TCP
+      TargetType: instance
+      VpcId:
+        Fn::ImportValue: !Sub "${ECSStackName}-vpc"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref TaskDefName
+      TaskRoleArn:
+        Fn::ImportValue: !Sub "${ECSStackName}-TaskRole"
+      NetworkMode: !Ref NetworkMode
+      Cpu: !Ref TaskCPU
+      Memory: !Ref TaskMemory
+      ContainerDefinitions:
+        - Name: !Ref ContainerName
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${Region}.amazonaws.com/${RepositoryName}:${Version}
+          MemoryReservation: !Ref SoftLimit
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupName
+              awslogs-region: !Ref Region
+
+  ServiceDiscoveryName:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Description: Private Hosted zone
+      Name: !Ref ServiceName
+      DnsConfig:
+        DnsRecords: [{Type: SRV, TTL: "60"}]
+        NamespaceId:
+          Fn::ImportValue: !Sub "${ECSStackName}-namespace"
+      HealthCheckCustomConfig:
+        FailureThreshold: 2
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: NLBListener
+    Properties: 
+      # Role:
+      #   Fn::ImportValue: !Sub "${ECSStackName}-ServiceRole"
+      ServiceName: !Ref ServiceName
+      ServiceRegistries:
+        - 
+          RegistryArn: !GetAtt ServiceDiscoveryName.Arn
+          ContainerName: !Ref ContainerName
+          ContainerPort: !Ref ContainerPort
+      LaunchType: EC2
+      SchedulingStrategy: REPLICA
+      Cluster:
+        Fn::ImportValue: !Sub "${ECSStackName}-Cluster"
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      # Tags:
+      #   - Key: Name
+      #     Value: !Ref ServiceName
+      LoadBalancers:
+        - ContainerName: !Ref ContainerName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref NLBTargetGroup
+
+  ServiceAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: Service
+    Properties:
+      ResourceId: !Join 
+          - "/"
+          - - service
+            - Fn::ImportValue: !Sub "${ECSStackName}-Cluster"
+            - !Ref ServiceName # !GetAtt Service.Name
+      ServiceNamespace: ecs
+      ScalableDimension: 'ecs:service:DesiredCount'
+      RoleARN: 
+        Fn::ImportValue: !Sub "${ECSStackName}-ServiceRoleArn"
+      MaxCapacity: '4'
+      MinCapacity: '1'
+
+  ServiceCPUAutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn: Service
+    Properties:
+      PolicyName: !Sub ${ServiceName}Scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceAutoScaling
+      TargetTrackingScalingPolicyConfiguration:
+       # DisableScaleIn: true
+        TargetValue: 75
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 300
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+  
+  ServiceScalingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      MetricName: RequestCountPerTarget
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1000
+      AlarmActions:
+        - !Ref ServiceCPUAutoScalingPolicy
+      OKActions:
+        - !Ref ServiceCPUAutoScalingPolicy
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt NLBTargetGroup.TargetGroupFullName
+      ComparisonOperator: GreaterThanOrEqualToThreshold    
+
+Outputs:
+  ResourceId:
+    Description: ResourceId
+    Value: !Join 
+      - /
+      - - service
+        - Fn::ImportValue: !Sub "${ECSStackName}-Cluster"
+        - !Ref ServiceName
+
+# Outputs:
+
+#   RepositoryName:
+#     Value: !Ref ECR
+  
+  # LogGroupName:
+  #   Value: !Ref CloudWatchLogsGroup

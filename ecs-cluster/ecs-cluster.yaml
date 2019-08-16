@@ -1,0 +1,350 @@
+---
+
+Description: Creates ECS Cluster with Network LoadBalancer,Route53 Private hosted zone, VPClinkID
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+  InstanceType:
+    Description: Specify the instance type
+    Type: String
+
+  ClusterMinSize:
+    Type: Number
+    Description: Minimum/desired number of ECS hosts deploys intially
+
+  ClusterMaxSize:
+    Type: Number
+    Description: Maximum Number of ECS Hosts to deploy
+
+  Subnet1:
+    Description: Specify the Subnet id of Availability Zone A
+    Type: AWS::EC2::Subnet::Id
+  
+  Subnet2:
+    Description: Specify the Subnet id of Availability Zone B
+    Type: AWS::EC2::Subnet::Id
+
+  VpcId:
+    Description: Specify the VPC ID which VPN was configured
+    Type: AWS::EC2::VPC::Id
+
+  VpcCIDR:
+    Description: Specify the CIDR Block of VPC
+    Type: String
+
+  Route53NameSpace:
+    Description: Route 53 NameSpace
+    Type: String
+  
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
+    Type: String 
+
+  DeviceName:
+    Type: String
+    Description: Optional - Specifies the device mapping for the Volume
+    Default: /dev/xvdcz
+
+  EbsVolumeSize:
+    Type: Number
+    Description: Specifies the Size in GBs, of the newly created Amazon Elastic Block Store (Amazon EBS) volume
+  
+  EbsVolumeType:
+    Type: String
+    Description: Optional - Specifies the Type of (Amazon EBS) volume
+    Default: standard
+
+  # Code1:
+  #   Type: String
+  #   Default: latest
+
+  # Code2:
+  #   Type: String
+  #   Default: latest
+
+  # Repository:
+  #   Type: String
+
+  # GitHubRepo:
+  #   Type: String
+
+  # TemplateBucket:
+  #   Type: String
+  #   Description: >
+  #     S3 Bucket used for nested templates
+
+Mappings:
+  AWSRegionToAMI:
+    us-east-1:
+      AMI: ami-71ef560b
+    us-east-2:
+      AMI: ami-1b8ca37e
+    us-west-1:
+      AMI: ami-e5cdf385
+    us-west-2:
+      AMI: ami-a64d9ade
+    eu-west-1:
+      AMI: ami-014ae578
+    eu-west-2:
+      AMI: ami-4f8d912b
+    eu-central-1:
+      AMI: ami-4255d32d
+    ap-northeast-1:
+      AMI: ami-3405af52
+    ap-southeast-1:
+      AMI: ami-134e0670
+    ap-southeast-2:
+      AMI: ami-2ab95148
+    ca-central-1:
+      AMI: ami-c802baac
+    ap-south-1:
+      AMI: ami-01ef9f6a829ae3956
+
+
+Resources:
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: !Sub ${EnvironmentName}-InstanceRole
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Sid": "",
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ec2.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonECS_FullAccess
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ECSRole
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    #Default: !Ref EnvironmentName
+    Properties:
+      GroupName: !Ref EnvironmentName
+      GroupDescription: Security Group created for FLEXI-STAGE Server
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: !Ref VpcCIDR
+      VpcId: !Ref VpcId
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref EnvironmentName
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: !Ref ClusterMinSize
+      MaxSize: !Ref ClusterMaxSize
+      DesiredCapacity: !Ref ClusterMinSize
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName #- ECS Host
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_add_instance_to_cluster:
+                command: !Sub echo ECS_CLUSTER=${Cluster} > /etc/ecs/ecs.config
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              mode: 000400
+              owner: root
+              group: root
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource LaunchConfiguration
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      ImageId: !FindInMap [ AWSRegionToAMI, !Ref "AWS::Region", AMI ]
+      InstanceType: !Ref InstanceType
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups:
+        - !Ref SecurityGroup
+      KeyName: !Ref KeyName
+      BlockDeviceMappings:
+        - DeviceName: !Ref DeviceName
+          Ebs:
+            #Name: !Ref EnvironmentName
+            VolumeSize: !Ref EbsVolumeSize
+            VolumeType: !Ref EbsVolumeType
+            DeleteOnTermination: true
+      UserData:
+        "Fn::Base64": !Sub |
+          #!/bin/bash
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource LaunchConfiguration
+          /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource AutoScalingGroup
+
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}
+      Type: network
+      Scheme: internal
+      Subnets:
+        # Fn::Split
+        #   - ","
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-NLB
+
+  VPCLink:
+    Type: AWS::ApiGateway::VpcLink
+    Properties:
+      Description: It Creates VPCLink which will acts as a bridge between internal Network Load Balancer and API Gateway
+      Name: !Sub ${EnvironmentName}-VPCLink
+      TargetArns: 
+        - !Ref NetworkLoadBalancer
+  
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-TaskExecutionRole
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Sid": "",
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ecs-tasks.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: !Sub ${EnvironmentName}ServiceRole
+      Path: /
+      AssumeRolePolicyDocument: |
+          {
+              "Statement": [{
+                  "Sid": "",
+                  "Effect": "Allow",
+                  "Principal": { "Service": [ "ecs.amazonaws.com" ]},
+                  "Action": [ "sts:AssumeRole" ]
+              }]
+          }
+      ManagedPolicyArns:    
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole
+
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties: 
+      Name: !Ref Route53NameSpace 
+      Vpc: !Ref VpcId
+  
+  ServiceScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}ServiceScalingRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - application-autoscaling.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+  
+Outputs:
+
+  Cluster:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub "${AWS::StackName}-Cluster"
+
+  NetworkLoadBalancer:
+    Value: !Ref NetworkLoadBalancer
+    Export:
+      Name: !Sub "${AWS::StackName}-NLB"
+
+
+  ServiceScalingRole:
+    Value: !Ref ServiceScalingRole
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceScalingRole"
+
+  TaskRole:
+    Value: !Ref TaskRole
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskRole"
+
+  ServiceRole:
+    Value: !Ref ServiceRole
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceRole"
+  
+  ServiceRoleArn:
+    Value: !GetAtt ServiceRole.Arn
+    Export: 
+      Name: !Sub "${AWS::StackName}-ServiceRoleArn"
+
+  ServiceDiscoveryNamespace:
+    Value: !Ref ServiceDiscoveryNamespace
+    Export:
+      Name: !Sub "${AWS::StackName}-namespace"
+
+  VpcId:
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub "${AWS::StackName}-vpc"

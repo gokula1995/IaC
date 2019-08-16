@@ -1,0 +1,138 @@
+---
+Parameters:
+  GreenBaseUrl:
+    Type: String
+  BlueBaseUrl:
+    Type: String
+  GreenVPCLinkId:
+    Type: String
+  BlueVPCLinkId:
+    Type: String
+  GreenStageName:
+    Type: String
+  BlueStageName:
+    Type: String
+  CognitoId:
+    Type: String
+
+Resources:
+
+  SampleAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SampleAPI
+      Description: SampleAPI Service
+      FailOnWarnings: true
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      RestApiId: 
+        Ref: SampleAPI
+      Type: COGNITO_USER_POOLS
+      IdentitySource: "method.request.header.Authorization"
+      ProviderARNs: 
+        - !Ref CognitoId
+
+# API Deployment
+  SampleAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+    - GetDemoApi
+    - GetDemoCORS
+    Properties:
+      RestApiId:
+        Ref: SampleAPI
+    
+# API Stages
+  SampleAPIGreenStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+    - GetDemoApi
+    - GetDemoCORS
+    Properties:
+      DeploymentId: !Ref SampleAPIDeployment
+      RestApiId: !Ref SampleAPI
+      StageName: !Ref GreenStageName
+      Variables:
+        BaseUrl: !Ref GreenBaseUrl
+        VpcLinkId: !Ref GreenVPCLinkId
+
+  SampleAPIBlueStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+    - GetDemoApi
+    - GetDemoCORS
+    Properties:
+      DeploymentId: !Ref SampleAPIDeployment
+      RestApiId: !Ref SampleAPI
+      StageName: !Ref BlueStageName
+      Variables:
+        BaseUrl: !Ref BlueBaseUrl
+        VpcLinkId: !Ref BlueVPCLinkId
+
+# API Resources
+  DemoApi:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SampleAPI
+      ParentId:
+        Fn::GetAtt:
+        - SampleAPI
+        - RootResourceId
+      PathPart: "demo"
+
+
+
+# Methods
+  
+
+  # POST /subscribe
+  GetDemoApi:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      AuthorizationScopes: 
+        - "sample/sample.read"
+      RestApiId: !Ref SampleAPI
+      ResourceId: !Ref DemoApi
+      HttpMethod: GET
+      Integration:
+        ConnectionType: VPC_LINK
+        ConnectionId: ${stageVariables.VpcLinkId}
+        IntegrationHttpMethod: "GET"
+        Type: HTTP_PROXY
+        Uri: http://${stageVariables.BaseUrl}/demo
+     
+
+  #CORS
+  GetDemoCORS:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref SampleAPI
+      ResourceId: !Ref DemoApi
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
